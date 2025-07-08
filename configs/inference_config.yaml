@@ -1,0 +1,32 @@
+# Inference Configuration
+data:
+  dataset_root: "/path/to/scannet"
+  scene_id: "scene0000_00"
+  image_size: [640, 480]
+  
+model:
+  checkpoint_path: "/path/to/checkpoint.pth"
+  ptv3:
+    input_dim: 6
+    output_dim: 512
+    num_layers: 4
+    num_heads: 8
+  
+  adapter:
+    input_dim: 512
+    output_dim: 512
+    hidden_dims: [256, 512]
+    
+inference:
+  batch_size: 1
+  online_update: true
+  consistency_threshold: 0.8
+  feature_update_rate: 0.1
+  
+output:
+  save_results: true
+  output_dir: "/path/to/output"
+  visualize: true
+  
+hardware:
+  device: "cuda"

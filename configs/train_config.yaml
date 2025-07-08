@@ -1,0 +1,45 @@
+# Training Configuration
+data:
+  dataset_root: "/path/to/scannet"
+  num_frames: 5  # Number of adjacent frames to load
+  image_size: [640, 480]
+  point_cloud_size: 50000  # Maximum points per frame
+  
+model:
+  ptv3:
+    input_dim: 6  # xyz + rgb
+    output_dim: 512  # Feature dimension
+    num_layers: 4
+    num_heads: 8
+  
+  adapter:
+    input_dim: 512  # PTv3 output dim
+    output_dim: 512  # CLIP text encoder dim
+    hidden_dims: [256, 512]
+  
+  clip:
+    model_name: "ViT-B/32"
+    
+training:
+  batch_size: 2
+  learning_rate: 0.001
+  num_epochs: 100
+  save_interval: 10
+  log_interval: 100
+  
+  # Loss weights
+  loss_weights:
+    instance_discrimination: 1.0
+    semantic_alignment: 1.0
+    cross_frame_consistency: 0.5
+    
+optimization:
+  optimizer: "AdamW"
+  weight_decay: 0.01
+  scheduler: "cosine"
+  warmup_epochs: 5
+
+hardware:
+  device: "cuda"
+  num_workers: 4
+  pin_memory: true
