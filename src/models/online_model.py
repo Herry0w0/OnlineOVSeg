@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Optional
 import logging
 
 from .pointtransformer import PointTransformerV3, FeatureAdapter
-from .clip_encoder import CLIPTextEncoder, LLaVATextGenerator
+from .clip_encoder import CLIPTextEncoder
 
 logger = logging.getLogger(__name__)
 

@@ -1,14 +1,13 @@
 import argparse
-from src.datasets.scannet_preprocess import ScanNet_scene
 from tqdm import tqdm
-
+from src.datasets.scannet_preprocess import ScanNet_scene
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ScanNet Scene Preprocessing")
     parser.add_argument('--base_dir', type=str, default="/media/ssd/jiangxirui/projects/2/data/ScanNetV2", help='Base directory of ScanNet data')
     parser.add_argument('--step_size', type=int, default=25, help='Step size for frame selection')
     parser.add_argument('--vis_dis', type=float, default=0.15, help='Visibility distance threshold')
-    parser.add_argument('--device', type=str, default='cuda:5', help='Device to use for processing')
+    parser.add_argument('--device', type=str, default='cuda:1', help='Device to use for processing')
     parser.add_argument('--clip_model', type=str, default='ViT-B/32', help='CLIP model to use for encoding')
     return parser.parse_args()
 

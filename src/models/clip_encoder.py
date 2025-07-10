@@ -1,22 +1,12 @@
-"""
-CLIP text encoder wrapper for generating semantic features and LLaVA for text generation
-"""
+import os
+from typing import List, Dict, Optional, Union
+import numpy as np
+from PIL import Image as PILImage
 import torch
 import torch.nn as nn
 import clip
-from typing import List, Dict, Optional, Union
-import logging
-import numpy as np
-from PIL import Image
-import requests
-from transformers import (
-    AutoProcessor, 
-    LlavaForConditionalGeneration,
-    AutoTokenizer,
-    BitsAndBytesConfig
-)
+from transformers import Gemma3ForConditionalGeneration, AutoProcessor
 
-logger = logging.getLogger(__name__)
 
 class CLIPTextEncoder(nn.Module):
     """CLIP text encoder for semantic feature extraction"""
@@ -27,7 +17,7 @@ class CLIPTextEncoder(nn.Module):
         self.model_name = model_name
         
         # Load CLIP model
-        self.clip_model, _ = clip.load(model_name, device=self.device, download_root=cache_dir)
+        self.clip_model, _ = clip.load(model_name, device=self.device, download_root=cache_dir, jit=False)
         self.clip_model.eval()
         
         # Freeze CLIP parameters
@@ -35,7 +25,7 @@ class CLIPTextEncoder(nn.Module):
             param.requires_grad = False
         
         self.feature_dim = self.clip_model.text_projection.shape[1]
-        logger.info(f"Loaded CLIP model {model_name} with feature dim {self.feature_dim}")
+        print(f"Loaded CLIP model {model_name} with feature dim {self.feature_dim}")
     
     @torch.no_grad()
     def encode_text(self, text_descriptions: List[str]) -> torch.Tensor:
@@ -64,195 +54,213 @@ class CLIPTextEncoder(nn.Module):
         return self.encode_text(text_descriptions)
 
 
-class LLaVATextGenerator:
+class Gemma3TextGenerator:
     """
-    LLaVA text generator for generating instance descriptions
-    Using Hugging Face transformers implementation
+    使用 Gemma 3 多模态模型生成实例描述
     """
     
-    def __init__(self, 
-                 model_id: str = "llava-hf/llava-1.5-7b-hf",
-                 load_in_4bit: bool = True,
-                 cache_dir: Optional[str] = None,
-                 device_map: Union[str, Dict] = "auto"):
+    def __init__(self, device, local_model_path, torch_dtype = torch.bfloat16):
         """
-        Initialize LLaVA model
-        
-        Args:
-            model_id: Hugging Face model ID for LLaVA
-            load_in_4bit: Whether to load model in 4-bit quantization for memory efficiency
-            cache_dir: Directory to cache downloaded models
-            device_map: Device mapping for model layers
+        初始化 Gemma 3 模型
         """
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
         
-        logger.info(f"Loading LLaVA model: {model_id}")
+        print("Loading Gemma 3 model")
         
-        # Configure quantization if requested
-        if load_in_4bit and self.device.type == "cuda":
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16
-            )
-            model_kwargs = {
-                "quantization_config": bnb_config,
-                "device_map": device_map,
-                "torch_dtype": torch.float16
-            }
-        else:
-            model_kwargs = {
-                "device_map": device_map,
-                "torch_dtype": torch.float16 if self.device.type == "cuda" else torch.float32
-            }
-        
-        # Load model and processor
-        self.model = LlavaForConditionalGeneration.from_pretrained(
-            model_id,
-            cache_dir=cache_dir,
-            **model_kwargs
+        # 加载模型和处理器
+        self.model = Gemma3ForConditionalGeneration.from_pretrained(
+            local_model_path,
+            device_map=self.device,
+            torch_dtype=torch_dtype,
+            local_files_only=True,
+            attn_implementation="eager"
         )
+
+        self.processor = AutoProcessor.from_pretrained(local_model_path, local_files_only=True, use_fast=True)
         
-        self.processor = AutoProcessor.from_pretrained(
-            model_id,
-            cache_dir=cache_dir
-        )
-        
-        # Set model to eval mode
+        # 设置为评估模式
         self.model.eval()
         
-        # Conversation template for generating descriptions
-        self.conversation_template = """USER: <image>
-Please describe each distinct object instance in this image that has the instance ID {instance_id} (shown in the segmentation mask). 
-Focus on the object's visual attributes including:
-- Object category (chair, table, monitor, etc.)
-- Color and material
-- Shape and size characteristics
-- Any distinctive features
+        print(f"Model loaded successfully on {self.device}")
 
-Provide a concise description in one sentence.
-ASSISTANT: """
-        
-        logger.info("LLaVA model loaded successfully")
-    
     @torch.no_grad()
     def generate_descriptions(self, 
                             image: torch.Tensor, 
                             instance_mask: torch.Tensor,
-                            max_new_tokens: int = 50,
-                            temperature: float = 0.2) -> Dict[int, str]:
+                            max_new_tokens: int = 100,
+                            do_sample: bool = False) -> Dict[int, str]:
         """
-        Generate text descriptions for each instance in the mask
+        为每个实例掩码生成文本描述
         
         Args:
-            image: [3, H, W] RGB image tensor (normalized to [0, 1])
-            instance_mask: [H, W] instance segmentation mask
-            max_new_tokens: Maximum number of tokens to generate
-            temperature: Temperature for generation (lower = more deterministic)
+            image: [3, H, W] RGB图像张量 (归一化到[0, 1])
+            instance_mask: [H, W] 实例分割掩码
+            max_new_tokens: 生成的最大token数
+            do_sample: 是否采样
         Returns:
-            Dictionary mapping instance_id -> text description
+            字典 instance_id -> 文本描述
         """
-        # Get unique instances (excluding background)
+
+        # 获取唯一实例
         unique_instances = torch.unique(instance_mask)
-        unique_instances = unique_instances[unique_instances > 0]
+        # unique_instances = unique_instances[unique_instances > 0]
         
         if len(unique_instances) == 0:
             return {}
         
         descriptions = {}
         
-        # Convert tensor image to PIL Image
+        # 转换图像格式
         image_np = image.cpu().numpy()
         if image_np.shape[0] == 3:  # CHW -> HWC
             image_np = np.transpose(image_np, (1, 2, 0))
         image_np = (image_np * 255).astype(np.uint8)
-        pil_image = Image.fromarray(image_np)
         
-        # Process each instance
+        # 创建原始场景的PIL图像
+        original_pil = PILImage.fromarray(image_np)
+        
+        # 处理每个实例
         for instance_id in unique_instances:
             instance_id_int = instance_id.item()
-            
-            # Create visualization with highlighted instance
-            # Create a copy of the image with the instance highlighted
             instance_binary_mask = (instance_mask == instance_id).cpu().numpy()
+
+            # 检查掩码大小
+            mask_area = np.sum(instance_binary_mask)
+            total_pixels = instance_binary_mask.shape[0] * instance_binary_mask.shape[1]
+            mask_ratio = mask_area / total_pixels
             
-            # Create highlighted image
-            highlighted_image = image_np.copy()
-            # Dim non-instance regions
-            highlighted_image[~instance_binary_mask] = (highlighted_image[~instance_binary_mask] * 0.3).astype(np.uint8)
+            # 设置最小阈值（可根据需要调整）
+            min_ratio_threshold = 0.045  # 最小占比
+
+            # 跳过太小的掩码
+            if mask_ratio < min_ratio_threshold:
+                print(f"Skipping instance {instance_id_int}: too small (area={mask_area}, ratio={mask_ratio:.4f})")
+                continue
+
+            # 获取掩码的边界框
+            coords = np.where(instance_binary_mask)
+            y_min, y_max = coords[0].min(), coords[0].max()
+            x_min, x_max = coords[1].min(), coords[1].max()
+
+            # 添加一些padding（可选，保留一些上下文）
+            padding = 10
+            y_min = max(0, y_min - padding)
+            y_max = min(image_np.shape[0], y_max + padding)
+            x_min = max(0, x_min - padding)
+            x_max = min(image_np.shape[1], x_max + padding)
+
+            # 裁剪图像
+            cropped_image = image_np[y_min:y_max, x_min:x_max]
+
+            # 创建裁剪后的掩码
+            cropped_mask = instance_binary_mask[y_min:y_max, x_min:x_max]
+
+            # 创建白色背景
+            cropped_with_bg = np.ones_like(cropped_image) * 255  # 白色背景
+
+            # 只复制掩码覆盖的像素
+            cropped_with_bg[cropped_mask] = cropped_image[cropped_mask]
+
+            cropped_pil = PILImage.fromarray(cropped_with_bg.astype(np.uint8))
             
-            # Add colored overlay for the instance
-            overlay = np.zeros_like(highlighted_image)
-            overlay[instance_binary_mask] = [255, 255, 0]  # Yellow highlight
-            highlighted_image = cv2.addWeighted(highlighted_image, 0.7, overlay, 0.3, 0)
+            output_dir = "/media/ssd/jiangxirui/projects/2/data/ScanNetV2/scene0000_00/processed/cropped_instances"
+            os.makedirs(output_dir, exist_ok=True)
+            filename = os.path.join(output_dir, f"cropped_instance_{instance_id_int}.png")
+            cropped_pil.save(filename)
+
+            # 构建消息格式（根据官方文档）
+            messages = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "You are a helpful assistant that describes objects in images with rich detail."}]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": original_pil},
+                        {"type": "text", "text": "Please observe this scene carefully. I will ask you about specific objects in it."}
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "I can see the scene. Please show me which specific object you'd like me to describe."}]
+                },
+                {
+                    "role": "user", 
+                    "content": [
+                        {"type": "image", "image": cropped_pil},
+                        {"type": "text", "text": f"""Based on the scene I showed you earlier, describe this specific object.
+Output Format: [NAMES] | [ATTRIBUTES], [FUNCTION]
+
+NAMES: 5-8 DIFFERENT nouns for this object (NO REPEATS)
+- Separated by commas
+- From specific to general
+- Example: desk, table, workstation, furniture
+
+ATTRIBUTES: [adjective phrase] about physical description (color, material, size, shape)
+FUNCTION: [verb phrase] describing its purpose
+
+Example outputs:
+"desk, table, workstation, work surface, furniture | wooden brown rectangular, holds office items"
+"chair, seat, office chair, swivel chair, furniture | black leather adjustable, provides seating"
+
+Rules:
+- First part: ONLY unique nouns, NO repeated words
+- Use pipe | to separate parts
+- Second part: TWO phrases separated by comma
+
+Output ONLY in the format shown. No other text."""}
+
+#                         {"type": "text", "text": f"""Based on the scene I showed you earlier, describe this specific object using EXACTLY 3 phrases:
+
+# Phrase 1: [adjectives] + [noun1] - describing the object type
+# Phrase 2: [adjectives] + [noun2] - describing the same object with a different noun
+# Phrase 3: [verb phrase] - describing its function/purpose
+
+# Rules:
+# - Use different nouns in phrase 1 and 2
+# - Adjectives can describe: size, color, material, shape
+# - Function phrase should start with a verb
+
+# Example output: "small wooden desk, beige office table, holds work items"
+
+# Output ONLY the 3 phrases separated by commas. No other text.
+# """}
+                    ]
+                }
+            ]
             
-            highlighted_pil = Image.fromarray(highlighted_image)
-            
-            # Prepare prompt
-            prompt = self.conversation_template.format(instance_id=instance_id_int)
-            
-            # Process inputs
-            inputs = self.processor(
-                text=prompt,
-                images=highlighted_pil,
+            # 应用聊天模板并处理输入
+            inputs = self.processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
                 return_tensors="pt"
-            )
+            ).to(self.model.device, dtype=torch.bfloat16)
             
-            # Move inputs to device
-            inputs = {k: v.to(self.model.device) if isinstance(v, torch.Tensor) else v 
-                     for k, v in inputs.items()}
+            # 获取输入长度（用于后续解码）
+            input_len = inputs["input_ids"].shape[-1]
             
-            # Generate description
-            output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=True if temperature > 0 else False,
-                pad_token_id=self.processor.tokenizer.pad_token_id
-            )
+            # 生成描述
+            with torch.inference_mode():
+                generation = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=do_sample
+                )
+                
+                # 只提取生成的部分（去除输入部分）
+                generated_tokens = generation[0][input_len:]
             
-            # Decode output
-            generated_ids = output_ids[0][inputs['input_ids'].shape[1]:]
-            description = self.processor.decode(generated_ids, skip_special_tokens=True)
+            # 解码生成的文本
+            description = self.processor.decode(generated_tokens, skip_special_tokens=True)
             
-            # Clean up description
+            # 清理和存储描述
             description = description.strip()
             if description:
                 descriptions[instance_id_int] = description
             else:
-                # Fallback description
-                descriptions[instance_id_int] = f"an object instance with ID {instance_id_int}"
+                descriptions[instance_id_int] = f"Object instance {instance_id_int}"
         
         return descriptions
-    
-    def generate_descriptions_batch(self,
-                                  images: List[torch.Tensor],
-                                  instance_masks: List[torch.Tensor],
-                                  batch_size: int = 4,
-                                  **kwargs) -> List[Dict[int, str]]:
-        """
-        Generate descriptions for multiple images in batches
-        
-        Args:
-            images: List of [3, H, W] RGB image tensors
-            instance_masks: List of [H, W] instance segmentation masks
-            batch_size: Batch size for processing
-            **kwargs: Additional arguments for generate_descriptions
-        Returns:
-            List of dictionaries mapping instance_id -> text description
-        """
-        all_descriptions = []
-        
-        for i in range(0, len(images), batch_size):
-            batch_images = images[i:i+batch_size]
-            batch_masks = instance_masks[i:i+batch_size]
-            
-            batch_descriptions = []
-            for img, mask in zip(batch_images, batch_masks):
-                desc = self.generate_descriptions(img, mask, **kwargs)
-                batch_descriptions.append(desc)
-            
-            all_descriptions.extend(batch_descriptions)
-        
-        return all_descriptions

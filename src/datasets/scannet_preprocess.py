@@ -1,16 +1,16 @@
 import os
-import numpy as np
-import cv2
-import torch
-import open3d as o3d
 import argparse
 from natsort import natsorted
 import glob
 from tqdm import tqdm
 import json
 import pickle
+import numpy as np
+import torch
+import open3d as o3d
+import cv2
 
-from ..models.clip_encoder import CLIPTextEncoder, LLaVATextGenerator
+from ..models.clip_encoder import CLIPTextEncoder, Gemma3TextGenerator
 
 
 class ScanNet_scene:
@@ -31,7 +31,11 @@ class ScanNet_scene:
 
         # Initialize CLIP encoder and text generator
         self.clip_encoder = CLIPTextEncoder(device=self.device, model_name=args.clip_model, cache_dir="/media/ssd/jiangxirui/projects/2/pretrained/clip")
-        self.llava_generator = LLaVATextGenerator(cache_dir="/media/ssd/jiangxirui/projects/2/pretrained/llava", device_map=self.device)
+
+        self.text_generator = Gemma3TextGenerator(
+                device=self.device,
+                local_model_path="/media/ssd/jiangxirui/projects/2/pretrained/gemma-3-4b-it"
+            )
 
     def _load_scene_point_cloud(self, scene_id: str) -> torch.Tensor:
         """Load complete scene point cloud"""
@@ -109,17 +113,21 @@ class ScanNet_scene:
         :return points_seen: (N, M), seen flag of all points in all views
         """
 
-        # project N points to M images
-        pts_cam, color_pixes, depth_pixes = self.torch_world2cam_pixel(
-            self.points[:, :3],  # (N, 3)
-            self.color_intrinsics, 
-            self.depth_intrinsics,
-            self.poses)  # (N, M, 3), (N, M, 2)
+        # Try to load cached data
+        points_label_path = os.path.join(self.base_dir, self.scene_id, "processed", "points_label.npy")
+        points_seen_path = os.path.join(self.base_dir, self.scene_id, "processed", "points_seen.npy")
+        if not (os.path.exists(points_label_path) and os.path.exists(points_seen_path)):
+            # project N points to M images
+            pts_cam, color_pixes, depth_pixes = self.torch_world2cam_pixel(
+                self.points[:, :3],  # (N, 3)
+                self.color_intrinsics, 
+                self.depth_intrinsics,
+                self.poses)  # (N, M, 3), (N, M, 2)
 
-        # (N, M)通过投影确定每个3D点在每个视图上是否可见
-        points_label, points_seen = self.get_points_label_and_seen(pts_cam, color_pixes, depth_pixes, vis_dis=self.vis_dis)
-        np.save(os.path.join(self.base_dir, self.scene_id, "processed", 'points_label.npy'), points_label)
-        np.save(os.path.join(self.base_dir, self.scene_id, "processed", 'points_seen.npy'), points_seen)
+            # (N, M)通过投影确定每个3D点在每个视图上是否可见
+            points_label, points_seen = self.get_points_label_and_seen(pts_cam, color_pixes, depth_pixes, vis_dis=self.vis_dis)
+            np.save(points_label_path, points_label)
+            np.save(points_seen_path, points_seen)
 
         self.generate_and_encode_descriptions()
 
@@ -235,6 +243,8 @@ class ScanNet_scene:
         
         # Process each frame
         for frame_idx in tqdm(range(self.M), desc='Generating text descriptions'):
+            # if frame_idx != 1:
+            #     continue
             # Get image and mask for this frame
             image = self.color_images[frame_idx]  # (H, W, 3)
             mask = self.masks[frame_idx]  # (H, W)
@@ -245,7 +255,7 @@ class ScanNet_scene:
             mask_tensor = torch.from_numpy(mask).to(self.device)
             
             # Generate descriptions for all instances in this frame
-            descriptions = self.llava_generator.generate_descriptions(image_tensor, mask_tensor)
+            descriptions = self.text_generator.generate_descriptions(image_tensor, mask_tensor)
             
             # Encode descriptions with CLIP
             clip_features = {}
@@ -273,36 +283,4 @@ class ScanNet_scene:
             with open(frame_feat_path, 'wb') as f:
                 pickle.dump(clip_features, f)
         
-        # Save metadata
-        metadata = {
-            'num_frames': self.M,
-            'clip_model': self.clip_encoder.model_name if hasattr(self.clip_encoder, 'model_name') else 'ViT-B/32',
-            'feature_dim': self.clip_encoder.feature_dim,
-            'frame_indices': list(range(self.M) * self.step_size)
-        }
-        
-        metadata_path = os.path.join(self.base_dir, self.scene_id, 'clip_metadata.json')
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
         print(f"Generated and encoded descriptions for {self.M} frames in scene {self.scene_id}")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ScanNet Scene Preprocessing")
-    parser.add_argument('--base_dir', type=str, default="/media/ssd/jiangxirui/projects/2/data/ScanNetV2", help='Base directory of ScanNet data')
-    parser.add_argument('--step_size', type=int, default=25, help='Step size for frame selection')
-    parser.add_argument('--vis_dis', type=float, default=0.15, help='Visibility distance threshold')
-    parser.add_argument('--device', type=str, default='cuda:5', help='Device to use for processing')
-    parser.add_argument('--clip_model', type=str, default='ViT-B/32', help='CLIP model to use for encoding')
-
-    args = parser.parse_args()
-
-    train_split = "/media/ssd/jiangxirui/projects/2/data/ScanNetV2/meta/scannetv2_train.txt"
-    
-    with open(train_split, 'r') as f:
-        scenes = [line.strip() for line in f.readlines()]
-
-    for scene_id in tqdm(sorted(scenes)):
-        print(scene_id)
-        scene_processor = ScanNet_scene(scene_id, args)
-        scene_processor.prepocess()
