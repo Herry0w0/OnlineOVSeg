@@ -5,7 +5,7 @@ from PIL import Image as PILImage
 import torch
 import torch.nn as nn
 import clip
-from transformers import Gemma3ForConditionalGeneration, AutoProcessor
+from transformers import BitsAndBytesConfig, Gemma3ForConditionalGeneration, AutoProcessor
 
 
 class CLIPTextEncoder(nn.Module):
@@ -59,13 +59,16 @@ class Gemma3TextGenerator:
     使用 Gemma 3 多模态模型生成实例描述
     """
     
-    def __init__(self, device, local_model_path, torch_dtype = torch.bfloat16):
+    def __init__(self, scene_id, device, local_model_path, torch_dtype = torch.bfloat16):
         """
         初始化 Gemma 3 模型
         """
+        self.scene_id = scene_id
         self.device = device
         
         print("Loading Gemma 3 model")
+
+        # quantization_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
         
         # 加载模型和处理器
         self.model = Gemma3ForConditionalGeneration.from_pretrained(
@@ -74,6 +77,7 @@ class Gemma3TextGenerator:
             torch_dtype=torch_dtype,
             local_files_only=True,
             attn_implementation="eager"
+            # quantization_config=quantization_config
         )
 
         self.processor = AutoProcessor.from_pretrained(local_model_path, local_files_only=True, use_fast=True)
@@ -85,10 +89,12 @@ class Gemma3TextGenerator:
 
     @torch.no_grad()
     def generate_descriptions(self, 
+                            frame_id: int,
                             image: torch.Tensor, 
                             instance_mask: torch.Tensor,
                             max_new_tokens: int = 100,
-                            do_sample: bool = False) -> Dict[int, str]:
+                            do_sample: bool = False,
+                            batch_size: int = 1) -> Dict[int, str]:
         """
         为每个实例掩码生成文本描述
         
@@ -109,6 +115,8 @@ class Gemma3TextGenerator:
             return {}
         
         descriptions = {}
+        all_messages = []
+        instance_ids = []
         
         # 转换图像格式
         image_np = image.cpu().numpy()
@@ -163,9 +171,9 @@ class Gemma3TextGenerator:
 
             cropped_pil = PILImage.fromarray(cropped_with_bg.astype(np.uint8))
             
-            output_dir = "/media/ssd/jiangxirui/projects/2/data/ScanNetV2/scene0000_00/processed/cropped_instances"
+            output_dir = os.path.join("/media/ssd/jiangxirui/projects/2/data/ScanNetV2", self.scene_id, "processed/cropped_instances")
             os.makedirs(output_dir, exist_ok=True)
-            filename = os.path.join(output_dir, f"cropped_instance_{instance_id_int}.png")
+            filename = os.path.join(output_dir, f"cropped_instance_{frame_id}_{instance_id_int}.png")
             cropped_pil.save(filename)
 
             # 构建消息格式（根据官方文档）
@@ -190,26 +198,26 @@ class Gemma3TextGenerator:
                     "content": [
                         {"type": "image", "image": cropped_pil},
                         {"type": "text", "text": f"""Based on the scene I showed you earlier, describe this specific object.
-Output Format: [NAMES] | [ATTRIBUTES], [FUNCTION]
+Output Format: [NAMES] | [ATTRIBUTES]
 
-NAMES: 5-8 DIFFERENT nouns for this object (NO REPEATS)
+NAMES: DIFFERENT nouns for this object (NO REPEATS)
+- what this object is called
 - Separated by commas
 - From specific to general
 - Example: desk, table, workstation, furniture
 
-ATTRIBUTES: [adjective phrase] about physical description (color, material, size, shape)
-FUNCTION: [verb phrase] describing its purpose
+ATTRIBUTES: adjectives for physical description (color, material, shape)
+
+Output Rules:
+- First part: NAMES, ONLY unique nouns, NO repeated words, 4 nouns at least
+- Second part: ATTRIBUTES, adjectives separated by comma
+- Use pipe | to separate parts
 
 Example outputs:
-"desk, table, workstation, work surface, furniture | wooden brown rectangular, holds office items"
-"chair, seat, office chair, swivel chair, furniture | black leather adjustable, provides seating"
+"desk, table, workstation, work surface, furniture | wooden, brown, rectangular"
+"chair, seat, office chair, swivel chair, furniture | black, leather, adjustable"
 
-Rules:
-- First part: ONLY unique nouns, NO repeated words
-- Use pipe | to separate parts
-- Second part: TWO phrases separated by comma
-
-Output ONLY in the format shown. No other text."""}
+Obey the Output Rules and Follow the Output Format. No other text."""}
 
 #                         {"type": "text", "text": f"""Based on the scene I showed you earlier, describe this specific object using EXACTLY 3 phrases:
 
@@ -229,38 +237,90 @@ Output ONLY in the format shown. No other text."""}
                     ]
                 }
             ]
-            
-            # 应用聊天模板并处理输入
-            inputs = self.processor.apply_chat_template(
-                messages,
+
+            all_messages.append(messages)
+            instance_ids.append(instance_id_int)
+
+        for i in range(0, len(all_messages), batch_size):
+            end_index = min(i + batch_size, len(all_messages))
+            batch_messages = all_messages[i:end_index]
+            batch_instance_ids = instance_ids[i:end_index]
+        
+            # 批量应用聊天模板
+            batch_inputs = self.processor.apply_chat_template(
+                batch_messages,
                 add_generation_prompt=True,
                 tokenize=True,
+                padding=True,
                 return_dict=True,
-                return_tensors="pt"
-            ).to(self.model.device, dtype=torch.bfloat16)
-            
-            # 获取输入长度（用于后续解码）
-            input_len = inputs["input_ids"].shape[-1]
-            
-            # 生成描述
+                return_tensors="pt").to(self.model.device, dtype=torch.bfloat16)
+
+            # 记录每个输入的长度（用于后续解码）
+            input_lengths = batch_inputs["attention_mask"].sum(dim=1).tolist()
+
+            # 批量生成
             with torch.inference_mode():
-                generation = self.model.generate(
-                    **inputs,
+                generation_outputs = self.model.generate(
+                    **batch_inputs,
                     max_new_tokens=max_new_tokens,
-                    do_sample=do_sample
-                )
+                    do_sample=do_sample,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id)
+            
+            # 第一步：提取所有生成的部分
+            generated_sequences = []
+            for idx, input_len in enumerate(input_lengths):
+                generated_tokens = generation_outputs[idx][input_len:]
+                generated_sequences.append(generated_tokens)
+
+            # 第二步：批量解码
+            batch_descriptions = self.processor.batch_decode(
+                generated_sequences,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False
+            )
+
+            # 第三步：映射结果
+            for instance_id, description in zip(batch_instance_ids, batch_descriptions):
+                description = description.strip()
+                if description:
+                    descriptions[instance_id] = description
+                else:
+                    descriptions[instance_id] = f"Object instance {instance_id}"
+            
+            torch.cuda.empty_cache()
+        
+            # # 应用聊天模板并处理输入
+            # inputs = self.processor.apply_chat_template(
+            #     messages,
+            #     add_generation_prompt=True,
+            #     tokenize=True,
+            #     return_dict=True,
+            #     return_tensors="pt"
+            # ).to(self.model.device, dtype=torch.bfloat16)
+            
+            # # 获取输入长度（用于后续解码）
+            # input_len = inputs["input_ids"].shape[-1]
+            
+            # # 生成描述
+            # with torch.inference_mode():
+            #     generation = self.model.generate(
+            #         **inputs,
+            #         max_new_tokens=max_new_tokens,
+            #         do_sample=do_sample
+            #     )
                 
-                # 只提取生成的部分（去除输入部分）
-                generated_tokens = generation[0][input_len:]
+            #     # 只提取生成的部分（去除输入部分）
+            #     generated_tokens = generation[0][input_len:]
             
-            # 解码生成的文本
-            description = self.processor.decode(generated_tokens, skip_special_tokens=True)
+            # # 解码生成的文本
+            # description = self.processor.decode(generated_tokens, skip_special_tokens=True)
             
-            # 清理和存储描述
-            description = description.strip()
-            if description:
-                descriptions[instance_id_int] = description
-            else:
-                descriptions[instance_id_int] = f"Object instance {instance_id_int}"
+            # # 清理和存储描述
+            # description = description.strip()
+            # if description:
+            #     descriptions[instance_id_int] = description
+            # else:
+            #     descriptions[instance_id_int] = f"Object instance {instance_id_int}"
         
         return descriptions

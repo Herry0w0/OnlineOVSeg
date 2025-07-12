@@ -33,32 +33,33 @@ class ScanNet_scene:
         self.clip_encoder = CLIPTextEncoder(device=self.device, model_name=args.clip_model, cache_dir="/media/ssd/jiangxirui/projects/2/pretrained/clip")
 
         self.text_generator = Gemma3TextGenerator(
+                scene_id=self.scene_id,
                 device=self.device,
-                local_model_path="/media/ssd/jiangxirui/projects/2/pretrained/gemma-3-4b-it"
+                local_model_path="/media/ssd/jiangxirui/projects/2/pretrained/gemma-3-12b-it"
             )
 
-    def _load_scene_point_cloud(self, scene_id: str) -> torch.Tensor:
-        """Load complete scene point cloud"""
+    def _load_scene_point_cloud(self, scene_id: str):
+        """Load complete scene point cloud as numpy array (Nx6)"""
 
         # Try to load cached scene point cloud
-        scene_pc_path = os.path.join(self.base_dir, scene_id, "processed", "scene_point_cloud.pth")
+        scene_pc_path = os.path.join(self.base_dir, scene_id, "processed", "scene_point_cloud.npy")
         if os.path.exists(scene_pc_path):
-            return torch.load(scene_pc_path).to(self.device)
+            return np.load(scene_pc_path)
         
         # Otherwise, aggregate from all frames (simplified)
         ply_path = os.path.join(self.base_dir, scene_id, f"{scene_id}_vh_clean_2.ply")
-
         pcd = o3d.io.read_point_cloud(ply_path)
         # Extract coordinates
         coords = np.asarray(pcd.points)  # (N, 3)
         # Extract colors
         colors = np.asarray(pcd.colors)  # (N, 3), normalized [0, 1]
-        # Combine into Nx6 tensor
-        scene_pc = torch.tensor(np.concatenate([coords, colors], axis=1), device=self.device, dtype=torch.float32)
+        # Combine into Nx6 numpy array
+        scene_pc = np.concatenate([coords, colors], axis=1)  # (N, 6)
 
         # Cache for future use
         os.makedirs(os.path.dirname(scene_pc_path), exist_ok=True)
-        torch.save(scene_pc, scene_pc_path)
+        np.save(scene_pc_path, scene_pc)
+
         return scene_pc
 
     def init_data(self, base_dir, scene_id):
@@ -72,7 +73,7 @@ class ScanNet_scene:
         masks = []
         color_images = []
 
-        for color_path in tqdm(color_list, desc='Read 2D data'):
+        for color_path in color_list:
             color_name = os.path.basename(color_path)
             num = int(color_name[:-4])
             if num % self.step_size != 0:
@@ -132,7 +133,7 @@ class ScanNet_scene:
         self.generate_and_encode_descriptions()
 
     @torch.inference_mode()
-    def torch_world2cam_pixel(self, points_world_all: torch.tensor, color_intrinsic: np.array, depth_intrinsic: np.array, pose: np.array):
+    def torch_world2cam_pixel(self, points_world_all: np.array, color_intrinsic: np.array, depth_intrinsic: np.array, pose: np.array):
         """project N points to M images
 
         :param points_world: (N, 3) the points coordinates in the world axis
@@ -143,6 +144,7 @@ class ScanNet_scene:
 
         batch_size = 10000
 
+        points_world_all = torch.tensor(points_world_all, device=self.device, dtype=torch.float32)  # (N, 3)
         color_intrinsic = torch.tensor(color_intrinsic, device=self.device, dtype=torch.float32)
         depth_intrinsic = torch.tensor(depth_intrinsic, device=self.device, dtype=torch.float32)
         pose = torch.tensor(pose, device=self.device, dtype=torch.float32)
@@ -243,7 +245,7 @@ class ScanNet_scene:
         
         # Process each frame
         for frame_idx in tqdm(range(self.M), desc='Generating text descriptions'):
-            # if frame_idx != 1:
+            # if frame_idx != 0:
             #     continue
             # Get image and mask for this frame
             image = self.color_images[frame_idx]  # (H, W, 3)
@@ -255,7 +257,7 @@ class ScanNet_scene:
             mask_tensor = torch.from_numpy(mask).to(self.device)
             
             # Generate descriptions for all instances in this frame
-            descriptions = self.text_generator.generate_descriptions(image_tensor, mask_tensor)
+            descriptions = self.text_generator.generate_descriptions(frame_idx*self.step_size, image_tensor, mask_tensor, batch_size=1)
             
             # Encode descriptions with CLIP
             clip_features = {}
